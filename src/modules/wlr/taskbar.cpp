@@ -23,6 +23,11 @@
 #include "util/gtk_icon.hpp"
 #include "util/rewrite_string.hpp"
 #include "util/string.hpp"
+#include <stdio.h>
+#include "modules/sway/ipc/ipc.hpp"
+#include "modules/sway/ipc/client.hpp"
+#include <cstdlib>
+#include <string> 
 
 namespace waybar::modules::wlr {
 
@@ -278,7 +283,10 @@ Task::Task(const waybar::Bar &bar, const Json::Value &config, Taskbar *tbar,
       seat_{seat},
       id_{global_id++},
       content_{bar.orientation, 0} {
-  zwlr_foreign_toplevel_handle_v1_add_listener(handle_, &toplevel_handle_impl, this);
+    
+  if (handle_) {
+    zwlr_foreign_toplevel_handle_v1_add_listener(handle_, &toplevel_handle_impl, this);
+  }
 
   button.set_relief(Gtk::RELIEF_NONE);
 
@@ -333,6 +341,9 @@ Task::Task(const waybar::Bar &bar, const Json::Value &config, Taskbar *tbar,
       config_["on-click-right"].isString()) {
   }
 
+  /* Only show apps within scratchpad */
+  only_scratchpad_ = config_["only-scratchpad"].asBool();
+
   button.add_events(Gdk::BUTTON_PRESS_MASK);
   button.signal_button_release_event().connect(sigc::mem_fun(*this, &Task::handle_clicked), false);
 
@@ -360,6 +371,7 @@ Task::~Task() {
 
 std::string Task::repr() const {
   std::stringstream ss;
+  //std::cout << "##### ID: " << id_ << " Title: " << title_ << " App_ID: " <<app_id_ << "\n";
   ss << "Task (" << id_ << ") " << title_ << " [" << app_id_ << "] <" << (active() ? "A" : "a")
      << (maximized() ? "M" : "m") << (minimized() ? "I" : "i") << (fullscreen() ? "F" : "f") << ">";
 
@@ -387,8 +399,21 @@ void Task::handle_title(const char *title) {
   hide_if_ignored();
 }
 
+void Task::setManualForSway(const int id, const std::string app_id, const std::string title) {
+  swayId_ = id;
+  handle_app_id(app_id.c_str());
+  title_ = title;
+  name_ = "";
+  isScratchpadMode_ = true;
+
+  //std::cout << "[[[[]]]] Having id " << global_id << "with app_id " << app_id_ << " and title: " << name_;
+  hide_if_ignored();
+  handle_output_enter(nullptr);
+  handle_done();
+}
+
 void Task::hide_if_ignored() {
-  if (tbar_->ignore_list().count(app_id_) || tbar_->ignore_list().count(title_)) {
+  if (tbar_->ignore_list().count(app_id_) || tbar_->ignore_list().count(title_) || hideNoScratchpad()) {
     ignored_ = true;
     if (button_visible_) {
       auto output = gdk_wayland_monitor_get_wl_output(bar_.output->monitor->gobj());
@@ -403,6 +428,13 @@ void Task::hide_if_ignored() {
     }
   }
 }
+
+/**
+ * Checks if the current app_id_ should be hidden if it is not a scratchpad element
+*/
+bool Task::hideNoScratchpad() {
+  return only_scratchpad_ && !isScratchpadMode_;
+} 
 
 void Task::handle_app_id(const char *app_id) {
   if (app_id_.empty()) {
@@ -455,7 +487,7 @@ void Task::handle_output_enter(struct wl_output *output) {
 
   spdlog::debug("{} entered output {}", repr(), (void *)output);
 
-  if (!button_visible_ && (tbar_->all_outputs() || tbar_->show_output(output))) {
+  if (!button_visible_ && (isScratchpadMode_ || tbar_->all_outputs() || tbar_->show_output(output))) {
     /* The task entered the output of the current bar make the button visible */
     tbar_->add_button(button);
     button.show();
@@ -467,7 +499,7 @@ void Task::handle_output_enter(struct wl_output *output) {
 void Task::handle_output_leave(struct wl_output *output) {
   spdlog::debug("{} left output {}", repr(), (void *)output);
 
-  if (button_visible_ && !tbar_->all_outputs() && tbar_->show_output(output)) {
+  if (button_visible_ && (isScratchpadMode_ || (!tbar_->all_outputs() && tbar_->show_output(output)) )) {
     /* The task left the output of the current bar, make the button invisible */
     tbar_->remove_button(button);
     button.hide();
@@ -523,7 +555,9 @@ void Task::handle_done() {
 
 void Task::handle_closed() {
   spdlog::debug("{} closed", repr());
-  zwlr_foreign_toplevel_handle_v1_destroy(handle_);
+  if (handle_) {
+    zwlr_foreign_toplevel_handle_v1_destroy(handle_);
+  }
   handle_ = nullptr;
   if (button_visible_) {
     tbar_->remove_button(button);
@@ -548,6 +582,27 @@ bool Task::handle_clicked(GdkEventButton *bt) {
     action = config_["on-click-middle"].asString();
   else if (config_["on-click-right"].isString() && bt->button == 3)
     action = config_["on-click-right"].asString();
+
+  // We can't handle click events because we have no wayland handler.
+  // So we implement it on our own :)
+  if (action == "close" || action == "activate") {
+    // Change focus to workspace
+    std::string command = "swaymsg [con_id=" + std::to_string(swayId_) + "] scratchpad show";
+    if (system(command.c_str()) != 0) {
+      spdlog::warn("Error while execution sway command {}", command);
+    }
+  }
+  // Kill the window
+  if (action == "close") {
+    auto command = "swaymsg kill";
+    if (system(command) != 0) {
+      spdlog::warn("Error while execution sway command {}", command);
+    }
+  }
+
+  if (isScratchpadMode_) {
+    return true;
+  }
 
   if (action.empty())
     return true;
@@ -788,7 +843,111 @@ Taskbar::Taskbar(const std::string &id, const waybar::Bar &bar, const Json::Valu
   }
 
   icon_themes_.push_back(Gtk::IconTheme::get_default());
+
+  // Sway IPC register
+  ipc_.subscribe(R"(["window"])");
+  ipc_.signal_event.connect(sigc::mem_fun(*this, &Taskbar::onSwayEvent));
+  ipc_.signal_cmd.connect(sigc::mem_fun(*this, &Taskbar::onSwayCmd));
+
+  getSwayTree();
+
+  ipc_.setWorker([this] {
+    try {
+      ipc_.handleEvent();
+    } catch (const std::exception& e) {
+      spdlog::error("Scratchpad: {}", e.what());
+    }
+  });
 }
+
+auto Taskbar::getSwayTree() -> void {
+  try {
+    ipc_.sendCmd(IPC_GET_TREE);
+  } catch (const std::exception& e) {
+    spdlog::error("Scratchpad: {}", e.what());
+  }
+}
+
+auto Taskbar::onSwayCmd(const struct waybar::modules::sway::Ipc::ipc_response& res) -> void {
+  try {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto tree = parser_.parse(res.payload);
+
+    // Sort the sway IDs aufsteigend
+    std::vector<SwayScratchpad> scratchpad;
+    for (const auto& window:  tree["nodes"][0]["nodes"][0]["floating_nodes"]) {
+      SwayScratchpad scratch;
+      scratch.id = window["id"].asInt();
+      scratch.app_id = window["app_id"].asString();
+      scratch.title = window["name"].asString();
+
+      scratchpad.push_back(scratch);
+    }
+    std::sort(scratchpad.begin(), scratchpad.end(), [](SwayScratchpad a, SwayScratchpad b) -> bool { 
+      return a.id < b.id; 
+    });
+
+    // We can't remove elements while iterating.
+    // So we cache them to remove them after iterating
+    std::vector<uint32_t> removals;
+
+    uint32_t lastId = 0;
+    for (const auto& window: scratchpad) {
+
+      // The list of apps within the scratchpad is ordered ascending.
+      // If we have an ID higher than the last one and the current one, we remove it.
+      bool taskFound = false;
+      uint32_t currentId = window.id;
+
+      for (auto &t : tasks_) {
+        // Only use scratchpad tasks
+        if (!t->isScratchpadMode()) {
+          continue;
+        }
+
+        if (t->swayId() == currentId) {
+          taskFound = true;
+        }
+
+        if (t->swayId() > lastId && t->swayId() < currentId) {
+          removals.push_back(t->id());
+        }
+      }
+
+      lastId = currentId;
+
+      // No entry found -> add a new one
+      if (!taskFound) {
+        tasks_.push_back(std::make_unique<Task>(bar_, config_, this, nullptr, seat_));
+        const int i = tasks_.size() - 1;
+        tasks_[i]->setManualForSway(window.id, window.app_id, window.title);
+      }
+    }
+
+    // Cleanup
+    for (auto &t : tasks_) {
+      // Only use scratchpad tasks
+      if (!t->isScratchpadMode()) {
+        continue;
+      }
+
+      if (t->swayId() > lastId) {
+        removals.push_back(t->id());
+      }
+    }
+
+    // Remove them
+    for (const auto& id: removals) {
+      remove_task(id);
+    }
+
+    dp.emit();
+  } catch (const std::exception& e) {
+    spdlog::error("Scratchpad: {}", e.what());
+  }
+}
+
+auto Taskbar::onSwayEvent(const struct waybar::modules::sway::Ipc::ipc_response& res) -> void { getSwayTree(); }
 
 Taskbar::~Taskbar() {
   if (manager_) {
@@ -810,6 +969,8 @@ Taskbar::~Taskbar() {
 }
 
 void Taskbar::update() {
+  std::lock_guard<std::mutex> lock(mutex_);
+
   for (auto &t : tasks_) {
     t->update();
   }
