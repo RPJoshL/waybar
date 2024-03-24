@@ -21,6 +21,7 @@
 #include "giomm/desktopappinfo.h"
 #include "util/json.hpp"
 #include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
+#include "modules/sway/ipc/client.hpp"
 
 namespace waybar::modules::wlr {
 
@@ -29,6 +30,13 @@ struct widget_geometry {
 };
 
 class Taskbar;
+
+class SwayScratchpad {
+  public:
+    int id;
+    std::string app_id;
+    std::string title;
+};
 
 class Task {
  public:
@@ -59,6 +67,7 @@ class Task {
   struct wl_seat *seat_;
 
   uint32_t id_;
+  uint32_t swayId_;
 
   Gtk::Box content_;
   Gtk::Image icon_;
@@ -67,6 +76,8 @@ class Task {
   Glib::RefPtr<Gio::DesktopAppInfo> app_info_;
   bool button_visible_ = false;
   bool ignored_ = false;
+  bool only_scratchpad_ = false;
+  bool isScratchpadMode_ = false;
 
   bool with_icon_ = false;
   bool with_name_ = false;
@@ -93,12 +104,15 @@ class Task {
   bool image_load_icon(Gtk::Image &image, const Glib::RefPtr<Gtk::IconTheme> &icon_theme,
                        Glib::RefPtr<Gio::DesktopAppInfo> app_info, int size);
   void hide_if_ignored();
+  bool hideNoScratchpad();
 
  public:
   /* Getter functions */
   uint32_t id() const { return id_; }
+  uint32_t swayId() const { return swayId_; }
   std::string title() const { return title_; }
   std::string app_id() const { return app_id_; }
+  bool isScratchpadMode() const { return isScratchpadMode_; }
   uint32_t state() const { return state_; }
   bool maximized() const { return state_ & MAXIMIZED; }
   bool minimized() const { return state_ & MINIMIZED; }
@@ -123,6 +137,8 @@ class Task {
                             Gtk::SelectionData &selection_data, guint info, guint time);
   void handle_drag_data_received(const Glib::RefPtr<Gdk::DragContext> &context, int x, int y,
                                  Gtk::SelectionData selection_data, guint info, guint time);
+
+  void setManualForSway(const int id, const std::string app_id, const std::string title);
 
  public:
   bool operator==(const Task &) const;
@@ -159,6 +175,15 @@ class Taskbar : public waybar::AModule {
 
   struct zwlr_foreign_toplevel_manager_v1 *manager_;
   struct wl_seat *seat_;
+
+  /* Sway scratchpad indicator */
+  std::mutex mutex_;
+  waybar::modules::sway::Ipc ipc_;
+  auto getSwayTree() -> void;
+  auto onSwayCmd(const struct waybar::modules::sway::Ipc::ipc_response&) -> void;
+  auto onSwayEvent(const struct waybar::modules::sway::Ipc::ipc_response&) -> void;
+  util::JsonParser parser_;
+  std::map<std::string, Task> swayWorkspaceMap;
 
  public:
   /* Callbacks for global registration */
